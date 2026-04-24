@@ -6,11 +6,11 @@
 
 Go middleware to make web APIs AI-agent-friendly — **Gin**, **Echo**, **Chi**.
 
-> Part of the [LightLayer](https://github.com/lightlayer-dev) ecosystem. Full feature parity with [agent-layer-ts](https://github.com/lightlayer-dev/agent-layer-ts) and [agent-layer-py](https://github.com/lightlayer-dev/agent-layer-py).
+> Part of the [LightLayer](https://github.com/lightlayer-dev) ecosystem. This Go SDK tracks the current agent-layer TypeScript/Python feature set.
 
 ## Features
 
-All 15 features from the TypeScript reference implementation, ported idiomatically to Go:
+18 agent-layer features, ported idiomatically to Go:
 
 | Feature | Description | Endpoint |
 |---------|-------------|----------|
@@ -19,11 +19,14 @@ All 15 features from the TypeScript reference implementation, ported idiomatical
 | **agents.txt** | Robots.txt-style permissions for AI agents | `GET /agents.txt` |
 | **llms.txt** | LLM-oriented documentation | `GET /llms.txt`, `/llms-full.txt` |
 | **Discovery** | AI manifest + JSON-LD | `GET /.well-known/ai` |
+| **robots.txt** | AI-aware robots.txt generation | `GET /robots.txt` |
 | **Rate Limiting** | In-memory sliding window, pluggable store | Middleware |
+| **Security Headers** | HSTS, CSP, frame/content/referrer policy headers | Middleware |
 | **Analytics** | Agent detection, event buffering, remote flush | Middleware |
 | **API Keys** | Scoped key generation, validation, `al_` prefix | Middleware |
 | **x402 Payments** | HTTP-native micropayments via facilitator | Middleware |
 | **Agent Identity** | SPIFFE/JWT claims, authz policies (IETF draft) | Middleware |
+| **Agent Onboarding** | Self-registration route + auth-required responses | `POST /agent/register`, middleware |
 | **Unified Discovery** | Single config → all discovery formats | Multiple |
 | **AG-UI Streaming** | Server-Sent Events for agent UIs | Handler |
 | **OAuth2** | PKCE, token exchange, RFC 8414 metadata | Handler |
@@ -76,6 +79,8 @@ func main() {
                 },
             },
         },
+        RobotsTxt: &core.RobotsTxtConfig{},
+        SecurityHeaders: &core.SecurityHeadersConfig{},
         RateLimit: &core.RateLimitConfig{Max: 100},
     }, r)
 
@@ -160,6 +165,37 @@ r.Use(agentgin.RateLimits(core.RateLimitConfig{
     Max:      100,
     WindowMs: 60000,
     KeyFn:    func(req interface{}) string { return "global" },
+}))
+```
+
+#### robots.txt (Echo)
+
+```go
+e := echo.New()
+e.GET("/robots.txt", agentecho.RobotsTxtHandler(core.RobotsTxtConfig{
+    Sitemaps: []string{"https://api.example.com/sitemap.xml"},
+}))
+```
+
+#### Security Headers (Chi)
+
+```go
+r := chi.NewRouter()
+r.Use(agentchi.SecurityHeaders(core.SecurityHeadersConfig{
+    ContentSecurityPolicy: "default-src 'self'",
+}))
+```
+
+#### Agent Onboarding (Gin)
+
+```go
+r := gin.Default()
+r.Use(agentgin.AgentOnboardingAuth(core.OnboardingConfig{
+    ProvisioningWebhook: "https://api.example.com/provision",
+    AuthDocs:            "https://docs.example.com/auth",
+}))
+r.POST("/agent/register", agentgin.AgentOnboardingHandler(core.OnboardingConfig{
+    ProvisioningWebhook: "https://api.example.com/provision",
 }))
 ```
 
@@ -276,11 +312,14 @@ github.com/lightlayer-dev/agent-layer-go/
 │   ├── agents_txt.go        # agents.txt generation + parsing
 │   ├── llms_txt.go          # llms.txt / llms-full.txt
 │   ├── discovery.go         # /.well-known/ai + JSON-LD
+│   ├── robots_txt.go        # /robots.txt generation
 │   ├── rate_limit.go        # Sliding window rate limiter
+│   ├── security_headers.go  # Response security headers
 │   ├── analytics.go         # Agent detection + event buffer
 │   ├── api_keys.go          # Scoped API key management
 │   ├── x402.go              # x402 payment protocol
 │   ├── agent_identity.go    # SPIFFE/JWT identity + authz
+│   ├── agent_onboarding.go  # Agent self-registration + auth-required responses
 │   ├── unified_discovery.go # Multi-format discovery
 │   ├── ag_ui.go             # AG-UI SSE streaming
 │   ├── oauth2.go            # OAuth2 PKCE + metadata

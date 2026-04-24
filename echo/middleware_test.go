@@ -1,8 +1,10 @@
 package agentlayerecho
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -41,6 +43,12 @@ func parseJSON(t *testing.T, rec *httptest.ResponseRecorder) map[string]interfac
 		t.Fatalf("failed to parse JSON response: %v\nbody: %s", err, rec.Body.String())
 	}
 	return result
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }
 
 // ── TestRateLimits ───────────────────────────────────────────────────────
@@ -348,8 +356,8 @@ func TestDiscoveryHandler(t *testing.T) {
 	e := setupEcho()
 	e.GET("/.well-known/ai", DiscoveryHandler(core.DiscoveryConfig{
 		Manifest: core.AIManifest{
-			Name:        "TestAgent",
-			Description: "A test agent",
+			Name:         "TestAgent",
+			Description:  "A test agent",
 			Capabilities: []string{"search", "summarize"},
 		},
 	}))
@@ -524,6 +532,88 @@ func TestAgentsTxtEnforce(t *testing.T) {
 		})
 		if rec.Code != 200 {
 			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+	})
+}
+
+func TestRobotsTxtHandler(t *testing.T) {
+	e := setupEcho()
+	e.GET("/robots.txt", RobotsTxtHandler(core.RobotsTxtConfig{}))
+
+	rec := doRequest(e, "GET", "/robots.txt", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "User-agent: GPTBot") {
+		t.Fatalf("expected AI-agent robots.txt content, got:\n%s", rec.Body.String())
+	}
+	if rec.Header().Get("Cache-Control") != "public, max-age=86400" {
+		t.Fatalf("unexpected cache-control: %q", rec.Header().Get("Cache-Control"))
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	e := setupEcho()
+	e.Use(SecurityHeaders(core.SecurityHeadersConfig{}))
+	e.GET("/test", func(c echo.Context) error {
+		return c.String(http.StatusOK, "ok")
+	})
+
+	rec := doRequest(e, "GET", "/test", "", nil)
+	if rec.Header().Get("Strict-Transport-Security") == "" {
+		t.Fatal("expected HSTS header")
+	}
+	if rec.Header().Get("Content-Security-Policy") != "default-src 'self'" {
+		t.Fatalf("unexpected CSP header: %q", rec.Header().Get("Content-Security-Policy"))
+	}
+}
+
+func TestAgentOnboarding(t *testing.T) {
+	httpClient := &http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(bytes.NewBufferString(`{"status":"provisioned","credentials":{"type":"api_key","token":"al_test_key"}}`)),
+			}, nil
+		}),
+	}
+
+	t.Run("register route provisions credentials", func(t *testing.T) {
+		e := setupEcho()
+		e.POST("/agent/register", AgentOnboardingHandler(core.OnboardingConfig{
+			ProvisioningWebhook: "https://example.com/provision",
+			HTTPClient:          httpClient,
+		}))
+
+		rec := doRequest(e, "POST", "/agent/register", `{"agent_id":"agent-1","agent_name":"Agent One","agent_provider":"OpenAI"}`, map[string]string{
+			"Content-Type": "application/json",
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), `"provisioned"`) {
+			t.Fatalf("expected provisioned response, got: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("auth middleware returns onboarding 401", func(t *testing.T) {
+		e := setupEcho()
+		e.Use(AgentOnboardingAuth(core.OnboardingConfig{
+			ProvisioningWebhook: "https://example.com/provision",
+			HTTPClient:          httpClient,
+			AuthDocs:            "https://example.com/auth",
+		}))
+		e.GET("/private", func(c echo.Context) error {
+			return c.String(http.StatusOK, "ok")
+		})
+
+		rec := doRequest(e, "GET", "/private", "", nil)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"register_url":"/agent/register"`) {
+			t.Fatalf("expected onboarding response, got: %s", rec.Body.String())
 		}
 	})
 }
@@ -1074,6 +1164,15 @@ func TestX402Middleware(t *testing.T) {
 
 func TestAgentLayer(t *testing.T) {
 	e := setupEcho()
+	httpClient := &http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(bytes.NewBufferString(`{"status":"provisioned"}`)),
+			}, nil
+		}),
+	}
 
 	store := core.NewMemoryApiKeyStore()
 	core.CreateApiKey(store, core.CreateApiKeyOptions{
@@ -1097,6 +1196,12 @@ func TestAgentLayer(t *testing.T) {
 				URL:  "https://example.com",
 			},
 		},
+		RobotsTxt:       &core.RobotsTxtConfig{},
+		SecurityHeaders: &core.SecurityHeadersConfig{},
+		AgentOnboarding: &core.OnboardingConfig{
+			ProvisioningWebhook: "https://example.com/provision",
+			HTTPClient:          httpClient,
+		},
 		MCP: &core.McpServerConfig{
 			Name:    "MyMCP",
 			Version: "1.0.0",
@@ -1109,6 +1214,9 @@ func TestAgentLayer(t *testing.T) {
 			{Method: "GET", Path: "/users", Summary: "List users"},
 		},
 	}, e)
+	e.GET("/private", func(c echo.Context) error {
+		return c.String(http.StatusOK, "ok")
+	})
 
 	t.Run("llms.txt registered", func(t *testing.T) {
 		rec := doRequest(e, "GET", "/llms.txt", "", nil)
@@ -1117,6 +1225,9 @@ func TestAgentLayer(t *testing.T) {
 		}
 		if !strings.Contains(rec.Body.String(), "My API") {
 			t.Error("expected llms.txt to contain title")
+		}
+		if rec.Header().Get("Strict-Transport-Security") == "" {
+			t.Error("expected security headers on response")
 		}
 	})
 
@@ -1148,7 +1259,8 @@ func TestAgentLayer(t *testing.T) {
 	t.Run("MCP endpoint registered", func(t *testing.T) {
 		payload := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
 		rec := doRequest(e, "POST", "/mcp", payload, map[string]string{
-			"Content-Type": "application/json",
+			"Content-Type":  "application/json",
+			"Authorization": "Bearer test-token",
 		})
 		if rec.Code != 200 {
 			t.Fatalf("expected 200 for /mcp, got %d", rec.Code)
@@ -1159,6 +1271,36 @@ func TestAgentLayer(t *testing.T) {
 		rec := doRequest(e, "GET", "/.well-known/oauth-authorization-server", "", nil)
 		if rec.Code != 200 {
 			t.Fatalf("expected 200 for OAuth2 metadata, got %d", rec.Code)
+		}
+	})
+
+	t.Run("robots.txt registered", func(t *testing.T) {
+		rec := doRequest(e, "GET", "/robots.txt", "", nil)
+		if rec.Code != 200 {
+			t.Fatalf("expected 200 for /robots.txt, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "User-agent: GPTBot") {
+			t.Fatalf("expected robots.txt content, got: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("onboarding auth middleware returns 401", func(t *testing.T) {
+		rec := doRequest(e, "GET", "/private", "", nil)
+		if rec.Code != 401 {
+			t.Fatalf("expected 401 for onboarding auth, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"register_url":"/agent/register"`) {
+			t.Fatalf("expected onboarding response, got: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("onboarding register route is wired", func(t *testing.T) {
+		rec := doRequest(e, "POST", "/agent/register", `{"agent_id":"agent-1","agent_name":"Agent One","agent_provider":"OpenAI"}`, map[string]string{
+			"Content-Type":  "application/json",
+			"Authorization": "Bearer test-token",
+		})
+		if rec.Code != 200 {
+			t.Fatalf("expected 200 for /agent/register, got %d: %s", rec.Code, rec.Body.String())
 		}
 	})
 }
