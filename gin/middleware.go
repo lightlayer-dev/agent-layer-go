@@ -107,14 +107,14 @@ func AgentAnalytics(config core.AnalyticsConfig) gin.HandlerFunc {
 		}
 
 		event := core.AgentEvent{
-			Agent:       agentName,
-			UserAgent:   userAgent,
-			Method:      c.Request.Method,
-			Path:        c.Request.URL.Path,
-			StatusCode:  c.Writer.Status(),
-			DurationMs:  time.Since(start).Milliseconds(),
-			Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
-			ContentType: c.Writer.Header().Get("Content-Type"),
+			Agent:        agentName,
+			UserAgent:    userAgent,
+			Method:       c.Request.Method,
+			Path:         c.Request.URL.Path,
+			StatusCode:   c.Writer.Status(),
+			DurationMs:   time.Since(start).Milliseconds(),
+			Timestamp:    time.Now().UTC().Format(time.RFC3339Nano),
+			ContentType:  c.Writer.Header().Get("Content-Type"),
 			ResponseSize: int64(c.Writer.Size()),
 		}
 
@@ -346,6 +346,70 @@ func AgentsTxtEnforce(config core.AgentsTxtConfig) gin.HandlerFunc {
 			return
 		}
 
+		c.Next()
+	}
+}
+
+// ── robots.txt ──────────────────────────────────────────────────────────
+
+// RobotsTxtHandler returns a handler that serves the /robots.txt document.
+func RobotsTxtHandler(config core.RobotsTxtConfig) gin.HandlerFunc {
+	content := core.GenerateRobotsTxt(&config)
+	return func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=86400")
+		c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(content))
+	}
+}
+
+// ── Security Headers ────────────────────────────────────────────────────
+
+// SecurityHeaders returns middleware that sets security headers on every response.
+func SecurityHeaders(config core.SecurityHeadersConfig) gin.HandlerFunc {
+	headers := core.GenerateSecurityHeaders(&config)
+	return func(c *gin.Context) {
+		for k, v := range headers {
+			c.Header(k, v)
+		}
+		c.Next()
+	}
+}
+
+// ── Agent Onboarding ────────────────────────────────────────────────────
+
+// AgentOnboardingHandler returns a handler for POST /agent/register.
+func AgentOnboardingHandler(config core.OnboardingConfig) gin.HandlerFunc {
+	handler := core.CreateOnboardingHandler(config)
+	return func(c *gin.Context) {
+		var body core.RegistrationRequest
+		if err := c.ShouldBindJSON(&body); err != nil {
+			envelope := core.FormatError(core.AgentErrorOptions{
+				Code:    "invalid_json",
+				Message: "Request body must be valid JSON.",
+				Status:  http.StatusBadRequest,
+			})
+			c.AbortWithStatusJSON(envelope.Status, gin.H{"error": envelope})
+			return
+		}
+
+		result := handler.HandleRegister(body, ginClientIP(c.Request))
+		c.JSON(result.Status, result.Body)
+	}
+}
+
+// AgentOnboardingAuth returns middleware that emits the standard onboarding 401 response.
+func AgentOnboardingAuth(config core.OnboardingConfig) gin.HandlerFunc {
+	handler := core.CreateOnboardingHandler(config)
+	return func(c *gin.Context) {
+		headers := map[string]string{}
+		for k, values := range c.Request.Header {
+			if len(values) > 0 {
+				headers[k] = values[0]
+			}
+		}
+		if handler.ShouldReturn401(c.Request.URL.Path, headers) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, handler.GetAuthRequiredResponse())
+			return
+		}
 		c.Next()
 	}
 }
@@ -737,12 +801,22 @@ func AgentLayer(config core.AgentLayerConfig, router gin.IRouter) {
 		router.Use(AgentAnalytics(*config.Analytics))
 	}
 
-	// 2. API key authentication.
+	// 2. Security headers.
+	if config.SecurityHeaders != nil {
+		router.Use(SecurityHeaders(*config.SecurityHeaders))
+	}
+
+	// 3. Onboarding auth-required responses.
+	if config.AgentOnboarding != nil {
+		router.Use(AgentOnboardingAuth(*config.AgentOnboarding))
+	}
+
+	// 4. API key authentication.
 	if config.ApiKeys != nil {
 		router.Use(ApiKeyAuth(*config.ApiKeys))
 	}
 
-	// 3. Rate limiting.
+	// 5. Rate limiting.
 	if config.RateLimit != nil {
 		router.Use(RateLimits(*config.RateLimit))
 	}
@@ -796,6 +870,14 @@ func AgentLayer(config core.AgentLayerConfig, router gin.IRouter) {
 		if config.AgentsTxt != nil {
 			router.GET("/agents.txt", AgentsTxtHandler(config.AgentsTxt.AgentsTxtConfig))
 		}
+
+		if config.RobotsTxt != nil {
+			router.GET("/robots.txt", RobotsTxtHandler(*config.RobotsTxt))
+		}
+	}
+
+	if config.AgentOnboarding != nil {
+		router.POST("/agent/register", AgentOnboardingHandler(*config.AgentOnboarding))
 	}
 
 	// Auth discovery endpoint.
@@ -817,6 +899,17 @@ func AgentLayer(config core.AgentLayerConfig, router gin.IRouter) {
 	if config.Errors == nil || *config.Errors {
 		router.Use(AgentErrors())
 	}
+}
+
+func ginClientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	if r.RemoteAddr != "" {
+		return r.RemoteAddr
+	}
+	return "unknown"
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -862,4 +955,3 @@ func GetX402Payment(c *gin.Context) *core.PaymentPayload {
 	}
 	return payload
 }
-

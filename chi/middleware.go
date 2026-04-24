@@ -3,8 +3,8 @@
 package agentlayerchi
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -411,6 +411,77 @@ func AgentsTxtHandler(config core.AgentsTxtConfig) http.HandlerFunc {
 	}
 }
 
+// ── RobotsTxtHandler ────────────────────────────────────────────────────
+
+// RobotsTxtHandler returns an http.HandlerFunc that serves /robots.txt.
+func RobotsTxtHandler(config core.RobotsTxtConfig) http.HandlerFunc {
+	body := core.GenerateRobotsTxt(&config)
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(body))
+	}
+}
+
+// ── SecurityHeaders ─────────────────────────────────────────────────────
+
+// SecurityHeaders returns middleware that sets security headers on every response.
+func SecurityHeaders(config core.SecurityHeadersConfig) func(http.Handler) http.Handler {
+	headers := core.GenerateSecurityHeaders(&config)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			for k, v := range headers {
+				w.Header().Set(k, v)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// ── Agent Onboarding ────────────────────────────────────────────────────
+
+// AgentOnboardingHandler returns an http.HandlerFunc that serves POST /agent/register.
+func AgentOnboardingHandler(config core.OnboardingConfig) http.HandlerFunc {
+	handler := core.CreateOnboardingHandler(config)
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body core.RegistrationRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErrorEnvelope(w, core.FormatError(core.AgentErrorOptions{
+				Code:    "invalid_json",
+				Message: "Request body must be valid JSON.",
+				Status:  http.StatusBadRequest,
+			}))
+			return
+		}
+
+		result := handler.HandleRegister(body, clientIP(r))
+		writeJSON(w, result.Status, result.Body)
+	}
+}
+
+// AgentOnboardingAuth returns middleware that emits the standard onboarding 401 response.
+func AgentOnboardingAuth(config core.OnboardingConfig) func(http.Handler) http.Handler {
+	handler := core.CreateOnboardingHandler(config)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			headers := map[string]string{}
+			for k, values := range r.Header {
+				if len(values) > 0 {
+					headers[k] = values[0]
+				}
+			}
+
+			if handler.ShouldReturn401(r.URL.Path, headers) {
+				writeJSON(w, http.StatusUnauthorized, handler.GetAuthRequiredResponse())
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // ── AgentsTxtEnforce ────────────────────────────────────────────────────
 
 // AgentsTxtEnforce returns middleware that enforces agents.txt rules based on the
@@ -700,6 +771,14 @@ func AgentLayer(config core.AgentLayerConfig) chi.Router {
 		r.Use(AgentErrors())
 	}
 
+	if config.SecurityHeaders != nil {
+		r.Use(SecurityHeaders(*config.SecurityHeaders))
+	}
+
+	if config.AgentOnboarding != nil {
+		r.Use(AgentOnboardingAuth(*config.AgentOnboarding))
+	}
+
 	if config.RateLimit != nil {
 		r.Use(RateLimits(*config.RateLimit))
 	}
@@ -746,6 +825,14 @@ func AgentLayer(config core.AgentLayerConfig) chi.Router {
 
 	if config.AgentsTxt != nil {
 		r.Get("/agents.txt", AgentsTxtHandler(config.AgentsTxt.AgentsTxtConfig))
+	}
+
+	if config.RobotsTxt != nil {
+		r.Get("/robots.txt", RobotsTxtHandler(*config.RobotsTxt))
+	}
+
+	if config.AgentOnboarding != nil {
+		r.Post("/agent/register", AgentOnboardingHandler(*config.AgentOnboarding))
 	}
 
 	if config.MCP != nil {
@@ -806,4 +893,15 @@ func AgentLayer(config core.AgentLayerConfig) chi.Router {
 	}
 
 	return r
+}
+
+func clientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	if r.RemoteAddr != "" {
+		return r.RemoteAddr
+	}
+	return "unknown"
 }

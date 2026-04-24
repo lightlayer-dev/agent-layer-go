@@ -403,6 +403,72 @@ func AgentsTxtEnforce(config core.AgentsTxtConfig) echo.MiddlewareFunc {
 	}
 }
 
+// ── robots.txt ──────────────────────────────────────────────────────────
+
+// RobotsTxtHandler returns a handler that serves robots.txt.
+func RobotsTxtHandler(config core.RobotsTxtConfig) echo.HandlerFunc {
+	content := core.GenerateRobotsTxt(&config)
+	return func(c echo.Context) error {
+		c.Response().Header().Set("Cache-Control", "public, max-age=86400")
+		return c.Blob(http.StatusOK, "text/plain; charset=utf-8", []byte(content))
+	}
+}
+
+// ── Security Headers ────────────────────────────────────────────────────
+
+// SecurityHeaders returns middleware that sets security headers on every response.
+func SecurityHeaders(config core.SecurityHeadersConfig) echo.MiddlewareFunc {
+	headers := core.GenerateSecurityHeaders(&config)
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			for k, v := range headers {
+				c.Response().Header().Set(k, v)
+			}
+			return next(c)
+		}
+	}
+}
+
+// ── Agent Onboarding ────────────────────────────────────────────────────
+
+// AgentOnboardingHandler returns a handler for POST /agent/register.
+func AgentOnboardingHandler(config core.OnboardingConfig) echo.HandlerFunc {
+	handler := core.CreateOnboardingHandler(config)
+	return func(c echo.Context) error {
+		var body core.RegistrationRequest
+		if err := c.Bind(&body); err != nil {
+			envelope := core.FormatError(core.AgentErrorOptions{
+				Code:    "invalid_json",
+				Message: "Request body must be valid JSON.",
+				Status:  http.StatusBadRequest,
+			})
+			return c.JSON(envelope.Status, map[string]interface{}{"error": envelope})
+		}
+
+		result := handler.HandleRegister(body, echoClientIP(c.Request()))
+		return c.JSON(result.Status, result.Body)
+	}
+}
+
+// AgentOnboardingAuth returns middleware that emits the onboarding auth-required response.
+func AgentOnboardingAuth(config core.OnboardingConfig) echo.MiddlewareFunc {
+	handler := core.CreateOnboardingHandler(config)
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			headers := map[string]string{}
+			for k, values := range c.Request().Header {
+				if len(values) > 0 {
+					headers[k] = values[0]
+				}
+			}
+			if handler.ShouldReturn401(c.Request().URL.Path, headers) {
+				return c.JSON(http.StatusUnauthorized, handler.GetAuthRequiredResponse())
+			}
+			return next(c)
+		}
+	}
+}
+
 // ── MCP (Model Context Protocol) ───────────────────────────────────────
 
 // McpHandler returns a handler that processes JSON-RPC requests for the MCP protocol.
@@ -679,6 +745,16 @@ func AgentLayer(config core.AgentLayerConfig, e *echo.Echo) {
 		e.Use(AgentErrors())
 	}
 
+	// Security headers middleware
+	if config.SecurityHeaders != nil {
+		e.Use(SecurityHeaders(*config.SecurityHeaders))
+	}
+
+	// Onboarding auth-required middleware
+	if config.AgentOnboarding != nil {
+		e.Use(AgentOnboardingAuth(*config.AgentOnboarding))
+	}
+
 	// Rate limiting middleware
 	if config.RateLimit != nil {
 		e.Use(RateLimits(*config.RateLimit))
@@ -705,6 +781,14 @@ func AgentLayer(config core.AgentLayerConfig, e *echo.Echo) {
 		if config.AgentsTxt.Enforce {
 			e.Use(AgentsTxtEnforce(config.AgentsTxt.AgentsTxtConfig))
 		}
+	}
+
+	if config.RobotsTxt != nil {
+		e.GET("/robots.txt", RobotsTxtHandler(*config.RobotsTxt))
+	}
+
+	if config.AgentOnboarding != nil {
+		e.POST("/agent/register", AgentOnboardingHandler(*config.AgentOnboarding))
 	}
 
 	// X402 payment middleware
@@ -752,4 +836,15 @@ func AgentLayer(config core.AgentLayerConfig, e *echo.Echo) {
 	if config.UnifiedDiscovery != nil {
 		UnifiedDiscoveryRoutes(*config.UnifiedDiscovery, e)
 	}
+}
+
+func echoClientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	if r.RemoteAddr != "" {
+		return r.RemoteAddr
+	}
+	return "unknown"
 }

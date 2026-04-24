@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -42,12 +43,18 @@ func decodeJSONBody(t *testing.T, body *bytes.Buffer) map[string]interface{} {
 	return result
 }
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
 // mockFacilitator is a test double for FacilitatorClient.
 type mockFacilitator struct {
-	verifyResp  *core.VerifyResponse
-	verifyErr   error
-	settleResp  *core.SettleResponse
-	settleErr   error
+	verifyResp *core.VerifyResponse
+	verifyErr  error
+	settleResp *core.SettleResponse
+	settleErr  error
 }
 
 func (m *mockFacilitator) Verify(payload core.PaymentPayload, requirements core.PaymentRequirements) (*core.VerifyResponse, error) {
@@ -448,6 +455,95 @@ func TestAgentsTxtEnforce(t *testing.T) {
 
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+	})
+}
+
+func TestRobotsTxtHandler(t *testing.T) {
+	r := setupRouter()
+	r.Get("/robots.txt", RobotsTxtHandler(core.RobotsTxtConfig{}))
+
+	req := httptest.NewRequest(http.MethodGet, "/robots.txt", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "User-agent: GPTBot") {
+		t.Fatalf("expected AI-agent robots.txt content, got:\n%s", rec.Body.String())
+	}
+	if rec.Header().Get("Cache-Control") != "public, max-age=86400" {
+		t.Fatalf("unexpected cache-control: %q", rec.Header().Get("Cache-Control"))
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	r := setupRouter()
+	r.Use(SecurityHeaders(core.SecurityHeadersConfig{}))
+	r.Get("/test", okHandler)
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Header().Get("Strict-Transport-Security") == "" {
+		t.Fatal("expected HSTS header")
+	}
+	if rec.Header().Get("Content-Security-Policy") != "default-src 'self'" {
+		t.Fatalf("unexpected CSP header: %q", rec.Header().Get("Content-Security-Policy"))
+	}
+}
+
+func TestAgentOnboarding(t *testing.T) {
+	httpClient := &http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(bytes.NewBufferString(`{"status":"provisioned","credentials":{"type":"api_key","token":"al_test_key"}}`)),
+			}, nil
+		}),
+	}
+
+	t.Run("register route provisions credentials", func(t *testing.T) {
+		r := setupRouter()
+		r.Post("/agent/register", AgentOnboardingHandler(core.OnboardingConfig{
+			ProvisioningWebhook: "https://example.com/provision",
+			HTTPClient:          httpClient,
+		}))
+
+		req := httptest.NewRequest(http.MethodPost, "/agent/register", strings.NewReader(`{"agent_id":"agent-1","agent_name":"Agent One","agent_provider":"OpenAI"}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), `"provisioned"`) {
+			t.Fatalf("expected provisioned response, got: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("auth middleware returns onboarding 401", func(t *testing.T) {
+		r := setupRouter()
+		r.Use(AgentOnboardingAuth(core.OnboardingConfig{
+			ProvisioningWebhook: "https://example.com/provision",
+			HTTPClient:          httpClient,
+			AuthDocs:            "https://example.com/auth",
+		}))
+		r.Get("/private", okHandler)
+
+		req := httptest.NewRequest(http.MethodGet, "/private", nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"register_url":"/agent/register"`) {
+			t.Fatalf("expected onboarding response, got: %s", rec.Body.String())
 		}
 	})
 }
@@ -1022,6 +1118,15 @@ func TestGetX402Payment(t *testing.T) {
 
 func TestAgentLayer(t *testing.T) {
 	store := core.NewMemoryApiKeyStore()
+	httpClient := &http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(bytes.NewBufferString(`{"status":"provisioned"}`)),
+			}, nil
+		}),
+	}
 
 	config := core.AgentLayerConfig{
 		LlmsTxt: &core.LlmsTxtConfig{
@@ -1045,6 +1150,12 @@ func TestAgentLayer(t *testing.T) {
 				Rules: []core.AgentsTxtRule{{Agent: "*", Allow: []string{"/*"}}},
 			},
 		},
+		RobotsTxt:       &core.RobotsTxtConfig{},
+		SecurityHeaders: &core.SecurityHeadersConfig{},
+		AgentOnboarding: &core.OnboardingConfig{
+			ProvisioningWebhook: "https://example.com/provision",
+			HTTPClient:          httpClient,
+		},
 		MCP: &core.McpServerConfig{
 			Name:    "TestMCP",
 			Version: "1.0.0",
@@ -1062,6 +1173,7 @@ func TestAgentLayer(t *testing.T) {
 	}
 
 	router := AgentLayer(config)
+	router.Get("/private", okHandler)
 
 	// We need a valid key to pass ApiKeyAuth
 	result := core.CreateApiKey(store, core.CreateApiKeyOptions{
@@ -1127,6 +1239,16 @@ func TestAgentLayer(t *testing.T) {
 		},
 		{
 			method:       http.MethodGet,
+			path:         "/robots.txt",
+			expectedCode: http.StatusOK,
+			checkBody: func(t *testing.T, body string) {
+				if !strings.Contains(body, "User-agent: GPTBot") {
+					t.Error("robots.txt should contain AI-agent rules")
+				}
+			},
+		},
+		{
+			method:       http.MethodGet,
 			path:         "/.well-known/oauth-authorization-server",
 			expectedCode: http.StatusOK,
 			checkBody: func(t *testing.T, body string) {
@@ -1147,6 +1269,9 @@ func TestAgentLayer(t *testing.T) {
 			if rec.Code != tc.expectedCode {
 				t.Fatalf("expected %d, got %d; body: %s", tc.expectedCode, rec.Code, rec.Body.String())
 			}
+			if rec.Header().Get("Strict-Transport-Security") == "" {
+				t.Fatalf("expected security headers on %s", tc.path)
+			}
 			if tc.checkBody != nil {
 				tc.checkBody(t, rec.Body.String())
 			}
@@ -1157,6 +1282,31 @@ func TestAgentLayer(t *testing.T) {
 	t.Run("POST /mcp", func(t *testing.T) {
 		payload := `{"jsonrpc":"2.0","id":1,"method":"initialize"}`
 		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", apiKey)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("onboarding auth middleware returns 401", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/private", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"register_url":"/agent/register"`) {
+			t.Fatalf("expected onboarding response, got: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("onboarding register route is wired", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/agent/register", strings.NewReader(`{"agent_id":"agent-1","agent_name":"Agent One","agent_provider":"OpenAI"}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-API-Key", apiKey)
 		rec := httptest.NewRecorder()

@@ -6,26 +6,26 @@ package core
 
 // AgentErrorEnvelope is the standard error response format for agent APIs.
 type AgentErrorEnvelope struct {
-	Type       string  `json:"type"`
-	Code       string  `json:"code"`
-	Message    string  `json:"message"`
-	Status     int     `json:"status"`
+	Type        string `json:"type"`
+	Code        string `json:"code"`
+	Message     string `json:"message"`
+	Status      int    `json:"status"`
 	IsRetriable bool   `json:"is_retriable"`
-	RetryAfter *int    `json:"retry_after,omitempty"`
-	Param      string  `json:"param,omitempty"`
-	DocsURL    string  `json:"docs_url,omitempty"`
+	RetryAfter  *int   `json:"retry_after,omitempty"`
+	Param       string `json:"param,omitempty"`
+	DocsURL     string `json:"docs_url,omitempty"`
 }
 
 // AgentErrorOptions are the options for creating an error envelope.
 type AgentErrorOptions struct {
-	Type       string
-	Code       string
-	Message    string
-	Status     int
+	Type        string
+	Code        string
+	Message     string
+	Status      int
 	IsRetriable *bool
-	RetryAfter *int
-	Param      string
-	DocsURL    string
+	RetryAfter  *int
+	Param       string
+	DocsURL     string
 }
 
 // ── Rate Limiting ───────────────────────────────────────────────────────
@@ -90,13 +90,13 @@ type RouteParameter struct {
 
 // AIManifest is the /.well-known/ai manifest document.
 type AIManifest struct {
-	Name         string            `json:"name"`
-	Description  string            `json:"description,omitempty"`
-	OpenAPIURL   string            `json:"openapi_url,omitempty"`
-	LlmsTxtURL   string            `json:"llms_txt_url,omitempty"`
-	Auth         *AIManifestAuth   `json:"auth,omitempty"`
+	Name         string             `json:"name"`
+	Description  string             `json:"description,omitempty"`
+	OpenAPIURL   string             `json:"openapi_url,omitempty"`
+	LlmsTxtURL   string             `json:"llms_txt_url,omitempty"`
+	Auth         *AIManifestAuth    `json:"auth,omitempty"`
 	Contact      *AIManifestContact `json:"contact,omitempty"`
-	Capabilities []string          `json:"capabilities,omitempty"`
+	Capabilities []string           `json:"capabilities,omitempty"`
 }
 
 // AIManifestAuth describes the authentication for the API.
@@ -162,6 +162,9 @@ type AgentLayerConfig struct {
 	A2A              *A2AConfig
 	AgentIdentity    *AgentIdentityConfig
 	AgentsTxt        *AgentsTxtMiddlewareConfig
+	RobotsTxt        *RobotsTxtConfig
+	SecurityHeaders  *SecurityHeadersConfig
+	AgentOnboarding  *OnboardingConfig
 	UnifiedDiscovery *UnifiedDiscoveryConfig
 	OAuth2           *OAuth2Config
 	MCP              *McpServerConfig
